@@ -1,0 +1,528 @@
+# Osprey SGLang patch
+# Base: sglang 0.5.9
+#
+# 4 files changed. Adds multi-layer + swap_h_and_emb EAGLE3 draft support,
+# and a Qwen3 EAGLE3 draft head. See sglang_patches/README.md.
+
+diff --git a/python/sglang/srt/models/llama.py b/python/sglang/srt/models/llama.py
+--- a/python/sglang/srt/models/llama.py
++++ b/python/sglang/srt/models/llama.py
+@@ -767,6 +767,15 @@
+             and self.config.target_hidden_size != self.config.hidden_size
+         ):
+             return
++        # Osprey: also skip when the draft was warm-started in swap mode
++        # (`swap_h_and_emb=True`, written by the SpecForgeParallel converter).
++        # In that mode `embed_tokens` carries the running residual stream and
++        # was prepared at conversion / tokenizer-alignment time; overwriting it
++        # with the target's raw embedding feeds the pretrained body an
++        # out-of-distribution input and collapses acceptance. Mirrors the
++        # trainer-side guard in SpecForgeParallel scripts/train_eagle3.py.
++        if bool(getattr(self.config, "swap_h_and_emb", False)):
++            return
+         del self.model.embed_tokens.weight
+         self.model.embed_tokens.weight = embed
+         torch.cuda.empty_cache()
+diff --git a/python/sglang/srt/models/llama_eagle3.py b/python/sglang/srt/models/llama_eagle3.py
+--- a/python/sglang/srt/models/llama_eagle3.py
++++ b/python/sglang/srt/models/llama_eagle3.py
+@@ -138,7 +138,28 @@
+             bias=getattr(config, "bias", False),
+         )
+
+-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
++        # Osprey: multi-layer EAGLE3 support. With num_hidden_layers > 1 the
++        # body is a `self.layers` ModuleList, matching the checkpoint layout
++        # written by SpecForgeParallel's
++        # convert_llama_to_eagle3_preserve_layers.py (`layers.{i}.*`). The
++        # legacy single `self.midlayer` path is kept byte-for-byte for
++        # 1-layer drafts, so vanilla EAGLE3 behaviour is unchanged.
++        self.num_eagle_layers = config.num_hidden_layers
++        if self.num_eagle_layers == 1:
++            self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
++        else:
++            self.layers = nn.ModuleList(
++                [
++                    LlamaDecoderLayer(config, i, quant_config, prefix)
++                    for i in range(self.num_eagle_layers)
++                ]
++            )
++
++        # Osprey: `swap_h_and_emb` is written by the converter for warm-started
++        # drafts. The trainer's TTT loop feeds the token embedding as the
++        # running residual stream and fc(target_aux) as the constant per-step
++        # side; replicate that swap here so inference matches training.
++        self.swap_h_and_emb = bool(getattr(config, "swap_h_and_emb", False))
+
+         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+@@ -166,14 +187,44 @@
+         if hidden_states.shape[0] == 0:
+             return hidden_states, [hidden_states]
+
++        # Osprey: pick which tensor enters which slot of the decoder layer.
++        # Vanilla EAGLE3 treats the second argument as the running residual
++        # stream. In swap mode the embedding is the running stream and
++        # fc(target_aux) is the constant side (see SpecForgeParallel
++        # specforge/core/eagle3.py).
++        if self.swap_h_and_emb:
++            layer_embeds_arg, layer_hidden_arg = hidden_states, embeds
++        else:
++            layer_embeds_arg, layer_hidden_arg = embeds, hidden_states
++
+         residual = None
+-        hidden_states, residual = self.midlayer(
+-            positions,
+-            embeds,
+-            hidden_states,
+-            forward_batch,
+-            residual,
+-        )
++        if self.num_eagle_layers == 1:
++            hidden_states, residual = self.midlayer(
++                positions,
++                layer_embeds_arg,
++                layer_hidden_arg,
++                forward_batch,
++                residual,
++            )
++        else:
++            # Each EAGLE3 decoder layer overwrites `residual = hidden_states`
++            # internally and feeds cat(LN(embeds), LN(hidden_states)) to
++            # attention. To chain layers we consolidate the previous layer's
++            # (hidden_states, residual) pair into one tensor before the next
++            # call, matching SpecForgeParallel's `_run_backbone_layers`.
++            layer_hidden = layer_hidden_arg
++            for idx, layer in enumerate(self.layers):
++                if idx > 0 and residual is not None:
++                    layer_hidden = layer_hidden + residual
++                    residual = None
++                layer_hidden, residual = layer(
++                    positions,
++                    layer_embeds_arg,
++                    layer_hidden,
++                    forward_batch,
++                    residual,
++                )
++            hidden_states = layer_hidden
+
+         hidden_states_to_logits, hidden_states_to_aux = self.norm(
+             hidden_states, residual
+@@ -195,9 +246,8 @@
+         self.quant_config = quant_config
+         self.pp_group = get_pp_group()
+
+-        if self.config.num_hidden_layers != 1:
+-            raise ValueError("EAGLE3 currently only supports 1 layer")
+-
++        # Osprey: multi-layer EAGLE3 is handled by LlamaModel's `self.layers`
++        # path; the 1-layer `self.midlayer` path is unchanged.
+         self.model = LlamaModel(
+             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+         )
+@@ -225,9 +275,11 @@
+
+         self.capture_aux_hidden_states = True
+         self.hot_token_id = None
++        self.loaded_embed_tokens = False
+
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+         params_dict = dict(self.named_parameters())
++        loaded_embed_tokens = False
+         # Define the parameter mapping for stacked parameters
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+@@ -268,6 +320,26 @@
+                         param, "weight_loader", default_weight_loader
+                     )
+                     weight_loader(param, loaded_weight)
++                    if param_name == "model.embed_tokens.weight":
++                        loaded_embed_tokens = True
++
++        # Osprey: a warm-started or hidden-size-mismatched draft must serve
++        # with its own embedding (set_embed above refuses to overwrite it).
++        # Fail loudly rather than silently running on a random table.
++        self.loaded_embed_tokens = loaded_embed_tokens
++        target_hidden_size = getattr(
++            self.config, "target_hidden_size", self.config.hidden_size
++        )
++        must_use_own_embed = bool(getattr(self.config, "swap_h_and_emb", False)) or (
++            target_hidden_size != self.config.hidden_size
++        )
++        if must_use_own_embed and not loaded_embed_tokens:
++            raise RuntimeError(
++                "EAGLE3 draft requires its own embed_tokens.weight "
++                "(swap_h_and_emb=True or target_hidden_size != hidden_size), "
++                "but the checkpoint does not contain it. Re-save the draft "
++                "checkpoint with embed_tokens.weight before serving."
++            )
+
+     def get_hot_token_id(self):
+         return self.hot_token_id
+diff --git a/python/sglang/srt/models/qwen3.py b/python/sglang/srt/models/qwen3.py
+--- a/python/sglang/srt/models/qwen3.py
++++ b/python/sglang/srt/models/qwen3.py
+@@ -565,6 +565,27 @@
+         torch.cuda.empty_cache()
+         torch.cuda.synchronize()
+
++    def get_embed(self):
++        return self.model.embed_tokens.weight
++
++    def set_embed(self, embed):
++        # NOTE: If draft hidden size != target hidden size, the embed weight
++        # cannot be shared for EAGLE3.
++        if (
++            hasattr(self.config, "target_hidden_size")
++            and self.config.target_hidden_size != self.config.hidden_size
++        ):
++            return
++        # Osprey: also skip when the draft was warm-started in swap mode
++        # (`swap_h_and_emb=True`). Mirror of the guard in llama.py; without it
++        # a Qwen3-based Osprey draft loses its aligned embedding at load time.
++        if bool(getattr(self.config, "swap_h_and_emb", False)):
++            return
++        del self.model.embed_tokens.weight
++        self.model.embed_tokens.weight = embed
++        torch.cuda.empty_cache()
++        torch.cuda.synchronize()
++
+     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+         self.model.load_kv_cache_scales(quantization_param_path)
+
+diff --git a/python/sglang/srt/models/qwen3_eagle3.py b/python/sglang/srt/models/qwen3_eagle3.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/models/qwen3_eagle3.py
+@@ -0,0 +1,331 @@
++"""
++Copyright 2023-2024 SGLang Team
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++"""
++Inference-only Qwen3-EAGLE3 model.
++
++Added by SpecForgeParallel (Osprey). Mirror of `llama_eagle3.py` but built on
++Qwen3's attention block, which applies a per-head RMSNorm to Q and K (Llama
++does not). We subclass Qwen3DecoderLayer and override only
++`self_attn.qkv_proj` so it accepts EAGLE3's `2 * hidden_size` concat; q_norm,
++k_norm, rotary, RadixAttention and o_proj are reused unchanged.
++
++Supports the three conversion features an Osprey drafter needs:
++  - `num_hidden_layers > 1`: multi-layer body via a `self.layers` ModuleList
++    (single-layer drafts keep the legacy `self.midlayer` path).
++  - `swap_h_and_emb`: the token embedding is the running residual stream and
++    fc(target_aux) is the constant per-step side, matching the trainer.
++  - `target_hidden_size != hidden_size`: fc compresses the 3 tapped target
++    layers down to the draft's hidden size.
++
++`set_embed` on the Qwen3ForCausalLM base is patched separately (see the
++llama.py / qwen3.py hunks) so a warm-started draft keeps its own embedding.
++"""
++
++import copy
++from typing import Iterable, Optional, Tuple
++
++import torch
++from torch import nn
++from transformers import Qwen3Config
++
++from sglang.srt.distributed import get_pp_group
++from sglang.srt.layers.layernorm import RMSNorm
++from sglang.srt.layers.linear import QKVParallelLinear
++from sglang.srt.layers.logits_processor import LogitsProcessor
++from sglang.srt.layers.quantization.base_config import QuantizationConfig
++from sglang.srt.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
++from sglang.srt.model_loader.weight_utils import default_weight_loader
++from sglang.srt.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM
++from sglang.srt.utils import add_prefix
++
++
++class Qwen3Eagle3DecoderLayer(Qwen3DecoderLayer):
++    def __init__(
++        self,
++        config: Qwen3Config,
++        layer_id: int = 0,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> None:
++        super().__init__(config, layer_id, quant_config, prefix)
++
++        # Widen qkv_proj to take the 2*hidden EAGLE3 concat. Qwen3Attention
++        # applies q_norm/k_norm on the per-head slice AFTER the qkv split, so
++        # they keep working unchanged.
++        self.self_attn.qkv_proj = QKVParallelLinear(
++            2 * self.hidden_size,
++            self.self_attn.head_dim,
++            self.self_attn.total_num_heads,
++            self.self_attn.total_num_kv_heads,
++            bias=getattr(config, "attention_bias", False),
++            quant_config=quant_config,
++            prefix=add_prefix("qkv_proj", prefix),
++        )
++        # Base SGLang Qwen3 leaves o_proj.reduce_results=False and relies on
++        # LayerCommunicator to all-reduce before the MLP. This EAGLE3 layer
++        # bypasses LayerCommunicator, so it must reduce here (matching Llama's
++        # attention and the trainer's dense math). Without it, TP shards are
++        # never summed and acceptance collapses.
++        self.self_attn.o_proj.reduce_results = True
++
++        # EAGLE3-specific extra norm applied to the h-side before the concat.
++        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++
++    def forward(
++        self,
++        positions: torch.Tensor,
++        embeds: torch.Tensor,
++        hidden_states: torch.Tensor,
++        forward_batch: ForwardBatch,
++        residual: Optional[torch.Tensor],
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        residual = hidden_states
++        embeds = self.input_layernorm(embeds)
++        hidden_states = self.hidden_norm(hidden_states)
++
++        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
++        hidden_states = self.self_attn(
++            positions=positions,
++            hidden_states=hidden_states,
++            forward_batch=forward_batch,
++        )
++
++        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        hidden_states = self.mlp(hidden_states)
++
++        return hidden_states, residual
++
++
++class Qwen3Model(nn.Module):
++    def __init__(
++        self,
++        config: Qwen3Config,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        self.config = config
++
++        self.vocab_size = config.vocab_size
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size,
++            config.hidden_size,
++            prefix=add_prefix("embed_tokens", prefix),
++        )
++
++        if hasattr(config, "target_hidden_size"):
++            self.hidden_size_in = config.target_hidden_size
++        else:
++            self.hidden_size_in = config.hidden_size
++
++        self.fc = torch.nn.Linear(
++            self.hidden_size_in * 3,
++            config.hidden_size,
++            bias=getattr(config, "bias", False),
++        )
++
++        # Multi-layer body, matching the `layers.{i}.*` checkpoint layout that
++        # convert_qwen3_to_eagle3_preserve_layers.py writes. Single-layer
++        # drafts keep the legacy `self.midlayer` name.
++        self.num_eagle_layers = config.num_hidden_layers
++        if self.num_eagle_layers == 1:
++            self.midlayer = Qwen3Eagle3DecoderLayer(config, 0, quant_config, prefix)
++        else:
++            self.layers = nn.ModuleList(
++                [
++                    Qwen3Eagle3DecoderLayer(config, i, quant_config, prefix)
++                    for i in range(self.num_eagle_layers)
++                ]
++            )
++
++        self.swap_h_and_emb = bool(getattr(config, "swap_h_and_emb", False))
++
++        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        forward_batch: ForwardBatch,
++        input_embeds: torch.Tensor = None,
++        pp_proxy_tensors: Optional[PPProxyTensors] = None,
++    ) -> torch.Tensor:
++        if input_embeds is None:
++            embeds = self.embed_tokens(input_ids)
++        else:
++            embeds = input_embeds
++
++        hidden_states = forward_batch.spec_info.hidden_states
++        if hidden_states.shape[-1] != embeds.shape[-1]:
++            # Step 0 of the spec round: the raw 3-layer target tap just
++            # arrived, so project it down to the draft hidden size.
++            hidden_states = self.fc(hidden_states)
++
++        # idle batch
++        if hidden_states.shape[0] == 0:
++            return hidden_states, [hidden_states]
++
++        if self.swap_h_and_emb:
++            layer_embeds_arg, layer_hidden_arg = hidden_states, embeds
++        else:
++            layer_embeds_arg, layer_hidden_arg = embeds, hidden_states
++
++        residual = None
++        if self.num_eagle_layers == 1:
++            hidden_states, residual = self.midlayer(
++                positions,
++                layer_embeds_arg,
++                layer_hidden_arg,
++                forward_batch,
++                residual,
++            )
++        else:
++            # Each layer overwrites `residual = hidden_states` internally, so
++            # consolidate the previous layer's (hidden_states, residual) pair
++            # into one running stream before the next call. Matches
++            # SpecForgeParallel's `_run_backbone_layers`.
++            layer_hidden = layer_hidden_arg
++            for idx, layer in enumerate(self.layers):
++                if idx > 0 and residual is not None:
++                    layer_hidden = layer_hidden + residual
++                    residual = None
++                layer_hidden, residual = layer(
++                    positions,
++                    layer_embeds_arg,
++                    layer_hidden,
++                    forward_batch,
++                    residual,
++                )
++            hidden_states = layer_hidden
++
++        hidden_states_to_logits, hidden_states_to_aux = self.norm(
++            hidden_states, residual
++        )
++
++        # For draft decode, we capture the hidden state before norm
++        return hidden_states_to_logits, [hidden_states_to_aux]
++
++
++class Qwen3ForCausalLMEagle3(Qwen3ForCausalLM):
++    def __init__(
++        self,
++        config: Qwen3Config,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> None:
++        nn.Module.__init__(self)
++        self.config = config
++        self.quant_config = quant_config
++        self.pp_group = get_pp_group()
++
++        self.model = Qwen3Model(
++            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
++        )
++
++        self.load_lm_head_from_target = False
++        if self.config.tie_word_embeddings:
++            self.lm_head = self.model.embed_tokens
++        else:
++            if config.draft_vocab_size is None:
++                self.load_lm_head_from_target = True
++                config.draft_vocab_size = config.vocab_size
++            self.lm_head = ParallelLMHead(
++                config.draft_vocab_size,
++                config.hidden_size,
++                quant_config=quant_config,
++                prefix=add_prefix("lm_head", prefix),
++            )
++
++        config_ = copy.deepcopy(config)
++        # The draft logits processor has its own vocab size.
++        config_.vocab_size = config_.draft_vocab_size
++        self.logits_processor = LogitsProcessor(config_)
++
++        self.capture_aux_hidden_states = True
++        self.hot_token_id = None
++        self.loaded_embed_tokens = False
++
++    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
++        params_dict = dict(self.named_parameters())
++        loaded_embed_tokens = False
++        stacked_params_mapping = [
++            # (param_name, shard_name, shard_id)
++            (".qkv_proj", ".q_proj", "q"),
++            (".qkv_proj", ".k_proj", "k"),
++            (".qkv_proj", ".v_proj", "v"),
++            (".gate_up_proj", ".gate_proj", 0),
++            (".gate_up_proj", ".up_proj", 1),
++        ]
++
++        for name, loaded_weight in weights:
++            if "d2t" in name:
++                # d2t stores diffs between draft id and target id
++                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
++                continue
++
++            if "t2d" in name:
++                continue
++
++            for param_name, weight_name, shard_id in stacked_params_mapping:
++                if weight_name not in name:
++                    continue
++                name = name.replace(weight_name, param_name)
++                param_name = f"model.{name}" if name not in params_dict else name
++                if param_name in params_dict:
++                    param = params_dict[param_name]
++                    weight_loader = getattr(
++                        param, "weight_loader", default_weight_loader
++                    )
++                    weight_loader(param, loaded_weight, shard_id)
++                break
++            else:
++                # Regular parameters, including q_norm / k_norm.
++                param_name = name if name in params_dict else f"model.{name}"
++                if param_name in params_dict:
++                    param = params_dict[param_name]
++                    weight_loader = getattr(
++                        param, "weight_loader", default_weight_loader
++                    )
++                    weight_loader(param, loaded_weight)
++                    if param_name == "model.embed_tokens.weight":
++                        loaded_embed_tokens = True
++
++        # A warm-started or hidden-size-mismatched draft must serve with its
++        # own embedding; fail loudly instead of running on a random table.
++        self.loaded_embed_tokens = loaded_embed_tokens
++        target_hidden_size = getattr(
++            self.config, "target_hidden_size", self.config.hidden_size
++        )
++        must_use_own_embed = bool(getattr(self.config, "swap_h_and_emb", False)) or (
++            target_hidden_size != self.config.hidden_size
++        )
++        if must_use_own_embed and not loaded_embed_tokens:
++            raise RuntimeError(
++                "EAGLE3 draft requires its own embed_tokens.weight "
++                "(swap_h_and_emb=True or target_hidden_size != hidden_size), "
++                "but the checkpoint does not contain it. Re-save the draft "
++                "checkpoint with embed_tokens.weight before serving."
++            )
++
++    def get_hot_token_id(self):
++        return self.hot_token_id
++
++
++EntryClass = [Qwen3ForCausalLMEagle3]

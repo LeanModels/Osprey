@@ -1,0 +1,1 @@
+{"id": "basic_0", "conversations": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "The capital of France is Paris."}, {"role": "user", "content": "And of Japan?"}, {"role": "assistant", "content": "Tokyo."}]}
