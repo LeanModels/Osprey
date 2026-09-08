@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specforge"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.11"
+description = "Osprey: target-agnostic pre-training for speculative decoding drafters"
+license = "Apache-2.0"
+dependencies = [
+    # torch / transformers / sglang are pinned: the SGLang patch in
+    # sglang_patches/ is authored against sglang 0.5.9.
+    "torch==2.9.1",
+    "transformers==4.57.1",
+    "sglang==0.5.9",
+    "accelerate",
+    "datasets",
+    "numpy",
+    "openai",
+    "pydantic",
+    "requests",
+    "setuptools",
+    "tensorboard",
+    "tqdm",
+    "wandb",
+]
+
+[project.optional-dependencies]
+# flash-attn powers the optional `fa` draft attention backend. Install with
+# --no-build-isolation after the base install; see README.md.
+fa = ["flash-attn"]
+dev = ["pre-commit", "pyflakes"]
+
+[tool.setuptools.packages.find]
+include = ["specforge*"]
+
+[tool.setuptools.dynamic]
+version = {file = "version.txt"}
